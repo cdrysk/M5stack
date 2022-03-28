@@ -1,0 +1,465 @@
+#include <M5Stack.h>
+#include <DHT.h>
+
+//変数宣言----------------------------------------------------------------------------
+
+//プログラムタイトル
+const char* ProgramTitle = "Battery charge&discharge test program Ver.1.0 by Nakano";
+
+// SDカードに保存するファイル名
+const char* CSVFileName = "/20210421_batterytestresult.txt";
+
+//測定値
+int BatteryDigitalVoltage=0;      //A/D変換前の電池電圧
+int DCOUTDigitalVoltage=0;        //A/D変換前のDC/DCコンバータ出力の電圧値
+float BatteryVoltage=0;           //A/D変換後の電池電圧の瞬時値
+float DCOUTVoltage=0;             //A/C変換後のDC/DCコンバータ出力の電圧値
+float Temperature=0;
+float Humidity=0;
+
+//フラグ
+volatile int ModeFlag=0;    //充電中または充電が必要な場合にはModeFlag=1,放電中はModeFlag=0
+
+//設定値
+int SoundVolume = 0;
+float Vref=3.6;                   //A/Dコンバータの基準電圧
+float BatteryErrorThreshold=1.0;  //再充電禁止電圧の設定[V]
+float BatteryLowThreshold=3.0;    //充電開始電圧（過放電電圧閾値）の設定[V]
+unsigned long MeasureInterval=60*1000;       //測定間隔[msec]
+int   SetCycleCount=50;                         //充放電サイクル数の設定
+unsigned long ChargeStopInterval=10800*1000;        //充電開始～停止までの時間[sec]
+
+//GPIO ピンアサイン
+const int Pin_ChargeControl = 3;
+const int Pin_DCOUTControl = 16;
+const int PIN_DHT = 5;
+DHT dht(PIN_DHT,DHT11);
+
+//変数
+int   CycleCount=0;               //充放電サイクル数[回]　充電が完了する度に1カウント追加
+int   MeasureCount=0;             //測定回数[回]
+unsigned long CountDownTime=ChargeStopInterval/1000;            //充電停止タイマーのカウントダウン用
+unsigned long CurrentTime=0;                  //現在時間
+unsigned long CurrentTime2=0;                  //現在時間
+unsigned long ChargeStartTime=0;              //充電開始時の時間
+unsigned long PreviousTime=0;
+unsigned long PreviousTime2=0;
+unsigned long TimeCalibration=0;
+
+//プリント位置指定
+int PrintSettingYCursol = 20;
+int PrintModeYCursol = 100;
+int PrintDataYCursol = 160;
+
+//メロディ用ドレミ
+int Do = 261;
+int Re = 294;
+int Mi = 329;
+int Fa = 349;
+int So = 392;
+int La = 440;
+int Si = 493;
+int Do2 = 523;
+int Re2 = 587;
+int Mi2 = 659;
+int Fa2 = 698;
+int So2 = 784;
+int La2 = 880;
+int Si2 = 988;
+int Do3 = 1047;
+int Re3 = 1175;
+int Mi3 = 1319;
+int Fa3 = 1397;
+int So3 = 1568;
+
+
+
+// // WiFiの設定
+// const char* ssid = "Galaxy";
+// const char* password = "nakanogalaxy";
+
+// //時刻を取得するサーバーに接続する情報
+// const char* ntpServer = "ntp.nict.jp";
+// const long  gmtOffset_sec = 3600 * 9;
+// const int   daylightOffset_sec = 0;
+
+//-----------------------------------------------------------------------------------
+
+// 自作関数---------------------------------------------------------------------------
+
+//メロディ
+void MelodyCoin(){
+  M5.Speaker.tone(Si2, 100);
+  delay(100);
+  M5.Speaker.tone(Mi3, 250);
+  delay(250);
+  M5.Speaker.mute();
+}
+
+void MelodyLowBattery(){
+  M5.Speaker.tone(Mi2, 200);
+  delay(200);
+  M5.Speaker.tone(Re2, 200);
+  delay(200);
+  M5.Speaker.tone(Do2, 200);
+  delay(200);
+  M5.Speaker.mute();
+}
+
+void MelodyErrorBattery(){
+  M5.Speaker.tone(Do2, 250);
+  delay(250);
+  M5.Speaker.tone(Do, 250);
+  delay(250);
+  M5.Speaker.tone(Do, 250);
+  delay(250);
+  M5.Speaker.mute();
+}
+
+void Melody1UP(){
+  M5.Speaker.tone(Mi2, 100);
+  delay(100);
+  M5.Speaker.tone(So2, 100);
+  delay(100);
+  M5.Speaker.tone(Mi3, 100);
+  delay(100);
+  M5.Speaker.tone(Do3, 100);
+  delay(100);
+  M5.Speaker.tone(Re3, 100);
+  delay(100);
+  M5.Speaker.tone(So3, 100);
+  delay(100);
+  M5.Speaker.mute();
+}
+
+void MelodyEnd(){
+  M5.Speaker.tone(523, 200);
+  delay(200);
+  M5.Speaker.tone(659, 300);
+  delay(200);
+  M5.Speaker.tone(800, 300);
+  delay(200);
+}
+
+void ChargeON(){
+  digitalWrite(Pin_ChargeControl,HIGH);  //5V入力がOFFになると充電停止
+  digitalWrite(Pin_DCOUTControl,LOW); //DCOUTをEnableにする
+  ModeFlag = 1;
+}
+
+void DischargeON(){
+  digitalWrite(Pin_ChargeControl,LOW);  //5V入力がOFFになると充電停止
+  digitalWrite(Pin_DCOUTControl,HIGH); //DCOUTをEnableにする
+  ModeFlag = 0;
+}
+
+void ALLOFF(){
+  digitalWrite(Pin_ChargeControl,LOW);  //5V入力がOFFになると充電停止
+  digitalWrite(Pin_DCOUTControl,LOW); //DCOUTをEnableにする
+}
+
+//充電完了タイマー（ある時間充電したら充電停止→放電開始）
+void ChargeControl(){
+  if(ModeFlag >= 1){
+      CurrentTime2 = millis();    // 現在時刻を取得
+
+      if ((CurrentTime2 - PreviousTime2) >= 1000) {  // 前回実行時刻から実行周期以上経過していたら
+          CountDownTime = CountDownTime -1;
+          M5.Lcd.setCursor(100, 130);
+          M5.lcd.printf("Charge countdown = %6ld [sec]",CountDownTime-1);
+          PreviousTime2 = CurrentTime2;
+      }
+
+      if ((CurrentTime2 - ChargeStartTime) >= ChargeStopInterval) {  // 前回実行時刻から実行周期以上経過していたら
+        DischargeON();
+        Melody1UP();
+        CycleCount++;
+        ModeFlag=0; //放電モードへ移行
+        M5.Lcd.clear();
+      }
+  }
+}
+
+//電池電圧から充電モードに移行すべきかを判定する関数
+// 1.過放電電圧まで放電させる。     ModeFlag=0;
+// 2.充電開始→タイマーをセット。    ModeFlag=0→2;（おいおい充電電流で充電完了を検出できるようにするが、今はタイマーで充電完了を制御する）
+// 3.充電中。                      ModeFlag=2→1;
+// 4.充電タイマー終了。             ModeFlag=1→0;
+// 4.放電開始。
+
+void ModeTransition(){
+  
+  if(BatteryVoltage < BatteryLowThreshold){
+    if(ModeFlag != 1){
+      ModeFlag = 2;
+    }
+  }  
+
+  if(BatteryVoltage < BatteryErrorThreshold){
+    ModeFlag = -1;
+  }
+
+    switch(ModeFlag){
+      case 0:
+        DischargeON();
+        M5.Lcd.setCursor(20, 110);
+        M5.Lcd.printf("Discharge mode      ");
+        break;
+      case 1:
+        ChargeON();
+        //ChargeControl();
+        M5.Lcd.setCursor(20, 110);
+        M5.Lcd.printf("Charge mode         ");
+        break;
+      case 2:
+        ChargeON();
+        CountDownTime=ChargeStopInterval/1000;
+        ChargeStartTime = millis();
+        M5.Lcd.setCursor(20, 110);
+        M5.Lcd.printf("Charge start!      ");
+        break;
+      case -1:
+        ALLOFF();
+        M5.Lcd.setCursor(20, 110);
+        M5.Lcd.printf("Battery error!       ");
+        break;
+    }
+  }
+
+// 電池電圧(ch1)をA/D変換して出力する関数
+float GetBatteryVoltage(){
+      BatteryVoltage = 0;
+      //5回測定した平均値を算出
+      for (int i=0; i<5; i++){
+        BatteryDigitalVoltage = analogRead( 35 );
+        BatteryVoltage = BatteryVoltage + 2 * BatteryDigitalVoltage * Vref / 4095.00; //半分に分圧して測定しているので2倍にする（M5Stackは5V入力不可、ADの入力は3.6Vまで？）
+        delay(10);
+      }
+      BatteryVoltage = BatteryVoltage / 5;
+      return BatteryVoltage;
+}
+
+// DC/DCコンバータの出力(ch2)の電圧をA/D変換して出力する関数
+float GetDCOUTVoltage(){
+      DCOUTVoltage = 0;
+      //5回測定した平均値を算出
+      for (int i=0; i<5; i++){
+        DCOUTDigitalVoltage = analogRead( 36 );
+        DCOUTVoltage = DCOUTVoltage + DCOUTDigitalVoltage * Vref / 4095.00;
+        delay(10);
+      }
+      DCOUTVoltage = DCOUTVoltage / 5;
+      return DCOUTVoltage;  
+}
+
+float GetTemperature(){
+      Temperature = 0;
+      //5回測定した平均値を算出
+      for (int i=0; i<5; i++){
+        Temperature = Temperature + dht.readTemperature();
+        delay(10);
+      }
+      Temperature = Temperature / 5;
+      return Temperature;  
+}
+
+float GetHumidity(){
+      Humidity = 0;
+      //5回測定した平均値を算出
+      for (int i=0; i<5; i++){
+        Humidity = Humidity + dht.readHumidity();
+        delay(10);
+      }
+      Humidity = Humidity / 5;
+      return Humidity;
+}
+
+//セッティング表示
+void PrintSetting(){
+  M5.Lcd.setCursor(20, PrintSettingYCursol);
+  M5.Lcd.printf("Settings");
+  M5.Lcd.setCursor(20, PrintSettingYCursol+10);
+  M5.Lcd.printf("-----------------------------------");
+  M5.Lcd.setCursor(20, PrintSettingYCursol+20);
+  M5.Lcd.printf("BatteryErrorThreshold = %1.2f [V]",BatteryErrorThreshold);
+  M5.Lcd.setCursor(20, PrintSettingYCursol+30);
+  M5.Lcd.printf("BatteryLowThreshold = %1.2f [V]",BatteryLowThreshold);
+  M5.Lcd.setCursor(20, PrintSettingYCursol+40);
+  M5.Lcd.printf("MeasureInterval = %5ld [sec]",MeasureInterval/1000); //単位をmsec→secに変換して表示
+  M5.Lcd.setCursor(20, PrintSettingYCursol+50);
+  M5.Lcd.printf("SetCycleCount = %5d [cycle]",SetCycleCount);
+  M5.Lcd.setCursor(20, PrintSettingYCursol+60);
+  M5.Lcd.printf("-----------------------------------");
+}
+
+void PrintProgramTitle(){
+  M5.Lcd.setTextSize(3);
+  M5.Lcd.setTextColor(GREEN);
+  M5.Lcd.setCursor(20, 30);
+  M5.Lcd.printf("Li-ion Battery");
+  M5.Lcd.setCursor(20, 70);
+  M5.Lcd.printf("Test Program");
+  M5.Lcd.setTextSize(2);
+  M5.Lcd.setCursor(20, 120);
+  M5.Lcd.printf("Ver.1.0.0");
+}
+
+void PrintTime(){
+  M5.Lcd.setCursor(150, 110);
+  M5.lcd.printf("Time = %6ld [sec]", (millis()-TimeCalibration)/1000);
+  M5.Lcd.setCursor(150, 120);
+  M5.lcd.printf("Time = %6ld [hour]",(millis()-TimeCalibration)/1000/3600);
+}
+
+// 電池電圧とDCOUT電圧を画面表示する関数
+void PrintMeasureData(){
+  GetBatteryVoltage();
+  GetDCOUTVoltage();
+  GetTemperature();
+  GetHumidity();
+  M5.Lcd.setCursor(20, PrintDataYCursol);
+  M5.Lcd.printf("Battery Voltage = %1.2f [V]",BatteryVoltage);
+  M5.Lcd.setCursor(20, PrintDataYCursol+10);
+  M5.Lcd.printf("DCOUT Voltage = %1.2f [V]",DCOUTVoltage);
+  M5.Lcd.setCursor(20, PrintDataYCursol+20);
+  M5.Lcd.printf("Temperature = %3.1f [degC]",Temperature);
+  M5.Lcd.setCursor(20, PrintDataYCursol+30);
+  M5.Lcd.printf("Humidity = %3.1f [percent]",Humidity);
+  M5.Lcd.setCursor(20, PrintDataYCursol+40);
+  M5.Lcd.printf("Measure count = %5d",MeasureCount);
+  M5.Lcd.setCursor(20, PrintDataYCursol+50);
+  M5.Lcd.printf("Cycle count = %5d",CycleCount);
+}
+
+void PrintEnd(){
+  M5.Lcd.clear(BLACK);
+  M5.Lcd.setTextSize(3);
+  M5.Lcd.setCursor(20, 120);
+  M5.Lcd.printf("Finish!     ");
+  delay(2000);
+  M5.Lcd.clear(BLACK);
+}
+
+//SDカードへの書き込み
+void WriteProgramTitle() {
+  File f = SD.open(CSVFileName, FILE_APPEND);
+  f.println(ProgramTitle);
+  f.close();
+}
+
+void WriteTableLabel() {
+  File f = SD.open(CSVFileName, FILE_APPEND);
+  f.println("Time[sec],Time[hour],BatteryVoltage[V],DCOUTVoltage[V],Temperature[degree C],Humidity[percentRH],ModeFlag,CycleCount[cycle]");
+  f.close();
+}
+
+void WriteData() {
+  File f = SD.open(CSVFileName, FILE_APPEND);
+  f.println(String(CurrentTime/1000) + "," + String(CurrentTime/1000/3600) + "," + String(BatteryVoltage) + "," + String(DCOUTVoltage) + "," + String(Temperature) + "," + String(Humidity) + "," + String(ModeFlag) + "," + String(CycleCount));
+  //f.println(String(CurrentTime) + "," + String(CurrentTime) + "," + String(BatteryVoltage) + "," + String(DCOUTVoltage) + "," + String(ModeFlag) + "," + String(CycleCount));
+  f.close();
+}
+
+void Measure(){
+  CurrentTime = millis();    // 現在時刻を取得
+  if ((CurrentTime - PreviousTime) >= MeasureInterval) {  // 前回実行時刻から実行周期以上経過していたら
+      GetBatteryVoltage();
+      GetDCOUTVoltage();
+      GetTemperature();
+      GetHumidity();
+      WriteData();
+      MeasureCount++;
+      PreviousTime = CurrentTime; 
+  }
+}
+
+//セットアップ------------------------------------------------------------------------
+
+void setup(){
+  M5.begin();
+  M5.Power.begin();
+  dht.begin();
+
+  //画面リセット
+  M5.Lcd.clear(BLACK);
+  PrintProgramTitle();
+
+  //GPIOの設定
+  pinMode(Pin_ChargeControl, OUTPUT); //5VINのON/OFFを制御する端子
+  digitalWrite(Pin_DCOUTControl,LOW);
+  pinMode(Pin_DCOUTControl, OUTPUT); //DCOUTのEnableに接続する端子
+  digitalWrite(Pin_ChargeControl,LOW);
+
+  //SDカードへの初期情報書き込み
+  WriteProgramTitle();
+  WriteTableLabel();
+
+  //セットアップ完了時のビープ音
+  M5.Speaker.setVolume(SoundVolume);
+  MelodyCoin();
+  
+}
+
+//メイン-----------------------------------------------------------------------------
+
+void loop(){
+
+  TimeCalibration = millis();
+
+  //初期画面の表示
+  M5.Lcd.setTextSize(3);
+  M5.Lcd.setTextColor(GREEN);
+  PrintProgramTitle();
+
+  M5.Lcd.setTextColor(WHITE, BLACK);
+  M5.Lcd.setTextSize(1.5);
+  M5.Lcd.setCursor(20, 170);
+  M5.Lcd.printf("SetCycleCount = %d",SetCycleCount);
+  M5.Lcd.setCursor(140, 220);
+  M5.Lcd.printf("[Start]");
+  M5.Lcd.setCursor(45, 220);
+  M5.Lcd.printf("CyCle[-]");
+  M5.Lcd.setCursor(230, 220);
+  M5.Lcd.printf("CyCle[+]");
+
+  //変数の初期化
+  ModeFlag=0;
+  MeasureCount=0;
+  CycleCount=0;
+
+  //ボタン押下を取得するための処理
+  M5.update();
+
+  //最も左のボタン(Aボタン)を押すと測定開始
+  if (M5.BtnB.wasPressed()) {
+
+    //画面リセット
+    M5.Lcd.clear(BLACK);
+    MelodyCoin();
+    PrintSetting();
+
+    //初期値取得
+    GetBatteryVoltage();
+    GetDCOUTVoltage();
+    DischargeON();
+
+    //サイクルカウントに達するまでモード判定を繰り返す
+    while(CycleCount <= SetCycleCount){                
+      GetTemperature();
+      GetHumidity();
+      Measure();
+      PrintMeasureData();
+      PrintSetting();
+      PrintTime();
+      ModeTransition();
+      ChargeControl();
+    }
+      
+    //プログラム終了時にはGPIOをOFFにする
+    ALLOFF();
+    MelodyEnd();
+    PrintEnd();
+    delay(2000);
+    M5.Power.reset();
+  }
+}
